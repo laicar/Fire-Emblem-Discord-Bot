@@ -64,3 +64,5 @@ typings/
 package-lock.json
 package.json
 config.json
+credentials.json
+token.json
