@@ -1,8 +1,10 @@
 const fs = require('fs');
 const readline = require('readline');
 const {google} = require('googleapis');
-const {sheetID, statsRange} = require('../config.json');
-const {PrimaryStat, SecondaryStat} = require('../game/stat');
+const {sheetID, statsRange, unitsRange} = require('../config.json');
+const teamQ = require('../index')
+const {isDegenerate} = require('../utils/utils');
+const Unit = require('../game/unit');
 
 // If modifying these scopes, delete token.json.
 const SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly'];
@@ -10,8 +12,6 @@ const SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly'];
 // created automatically when the authorization flow completes for the first
 // time.
 const TOKEN_PATH = 'token.json';
-
-let stats = [];
 
 /**
  * Create an OAuth2 client with the given credentials, and then execute the
@@ -68,7 +68,86 @@ function getNewToken(oAuth2Client, callback, message, range) {
 }
 
 /**
- * 
+ * Read unit data from a spreadsheet and update bot accordingly.
+ * @param {google.auth.OAuth2} auth The authenticated Google OAuth client.
+ * @param {Object} message The Discord command message.
+ * @param {String} range The Google Sheets range to read in A1 notation.
+ */
+function setupUnits(auth, message, range) {
+	if (range === null) range = unitsRange;
+	const gSheets = google.sheets({version: 'v4', auth});
+	gSheets.spreadsheets.values.get({
+		spreadsheetId: sheetID,
+		range: range,
+		majorDimension: "COLUMNS",
+	}, (err, res) => {
+		if (err) {
+			message.channel.send(`Error during unit setup.`);
+			return console.log('The API returned an error during unit setup: ' + err);
+		}
+		const resultColumns = res.data.values;
+		if (resultColumns.length) {
+			teamQ.playerUnits = new Map(); //TODO remove that once board creation is properly done
+			for (let i = 1; i < resultColumns.length; i++) {
+				const attributes = new Map();
+				const statsBases = new Map();
+				const statsGrowths = new Map();
+				const skills = new Map();
+				for (let j = 0; j < resultColumns[i].length; j++) {
+					if (resultColumns[0][j].endsWith("Base")) {
+						try {
+							addUnitStat(statsBases, message, resultColumns[0][j], resultColumns[i][j]);
+						} catch (error) {
+							console.error(error);
+							return;
+						}
+					} else if (resultColumns[0][j].endsWith("Growth")) {
+						try {
+							addUnitStat(statsGrowths, message, resultColumns[0][j], resultColumns[i][j]);
+						} catch (error) {
+							console.error(error);
+							return;
+						}
+					} else if (checkSkillHeaders(resultColumns, j)) {
+						skills.set(resultColumns[i][j], resultColumns[i][j+1]);
+						j++;
+					}
+					else {
+						attributes.set(resultColumns[0][j], resultColumns[i][j]);//Placeholder for the rest of the attributes
+					}
+				}
+				unit = new Unit(attributes, skills, statsBases, statsGrowths);
+				teamQ.playerUnits.set(unit.attributes.get("Name"), unit); //TODO update that if needed
+				message.channel.send(unit.embed());
+			}
+			teamQ.createBoard();//TODO remove that once the board is properly created
+			message.channel.send(`Unit setup complete.`);
+		} else {
+			message.channel.send(`No unit data found.`);
+		}
+	});
+
+	function checkSkillHeaders(resultColumns, j) {
+		const header1 = resultColumns[0][j].split(" ");
+		const header2 = resultColumns[0][j+1].split(" ");
+		return header1[0] === "Skill" && header2[0] === "Skill" && header1[1] === header2[1] && header2[2] === "Level";
+	}
+
+	function addUnitStat(map, message, headerCell, dataCell) {
+		const stat = headerCell.split(" ")[0];
+		if (teamQ.statNames.includes(stat)) {
+			map.set(stat, dataCell);
+		} else {
+			message.channel.send(`Stat ${stat} unknown. Please setup the stats and verify the spreadsheet.`);
+			throw `Unknown stat ${stat} during unit stats setup`;
+		}
+	}
+}
+
+/**
+ * Read stat data from a spreadsheet and update bot accordingly.
+ * Stats are divided into primary and secondary,
+ * with secondary stats being a linear function of primary stats
  * @param {google.auth.OAuth2} auth The authenticated Google OAuth client.
  * @param {Object} message The Discord command message.
  * @param {String} range The Google Sheets range to read in A1 notation.
@@ -80,30 +159,41 @@ function setupStats(auth, message, range) {
 		spreadsheetId: sheetID,
 		range: range,
 	}, (err, res) => {
-		if (err) return console.log('The API returned an error: ' + err);
-		const rows = res.data.values;
-		if (rows.length) {
-			//j = 2 because the first cell is empty and the second one is that flat modifier.
-			for (let j = 2; j < rows[0].length; j++) {
-				stats.push(new PrimaryStat(rows[0][j]));
-			}
-			for (let i = 1; i < rows.length; i++) {
-				if (rows[i][0]) {
-					let pStatFormulaMap = new Map();
-					for (let j = 1; j < rows[i].length; j++) {
-						if (rows[i][j]) {
-							pStatFormulaMap.set(rows[0][j], rows[i][j])
-						}
-					}
-					stats.push(new SecondaryStat(rows[i][0], pStatFormulaMap));
-				}
-			}
-			console.log(stats);
-			message.channel.send(`Stat setup complete.`);
+		if (err) {
+			message.channel.send(`Error during stat setup.`);
+			return console.log('The API returned an error during stat setup: ' + err);
+		}
+		if (res.data.values.length) {
+			teamQ.statNames.length = 0;
+			setupPrimaryStats(res.data.values);
+			setupSecondaryStats(res.data.values);
+			message.channel.send(`Stat setup complete.\n${teamQ.statNames.join(", ")}`);
 		} else {
 			message.channel.send(`No stat data found.`);
 		}
 	});
+
+	function setupSecondaryStats(resultRows) {
+		for (let i = 1; i < resultRows.length; i++) {
+			if (resultRows[i][0]) {
+				teamQ.statNames.push(resultRows[i][0]);
+				let statFormulaMap = new Map();
+				for (let j = 1; j < resultRows[i].length; j++) {
+					if (resultRows[i][j]) {
+						statFormulaMap.set(resultRows[0][j], resultRows[i][j]);
+					}
+				}
+				teamQ.secondaryStatFormulas.set(resultRows[i][0], statFormulaMap);
+			}
+		}
+	}
+
+	function setupPrimaryStats(resultRows) {
+		//j = 2 because the first cell is empty and the second one is that flat modifier.
+		for (let j = 2; j < resultRows[0].length; j++) {
+			teamQ.statNames.push(resultRows[0][j]);
+		}
+	}
 }
 /*
 function columnNumberToLetter(number) {
@@ -132,9 +222,9 @@ module.exports = {
 	description: `Sets up the bot\'s database, either whole or only partially.
 Except for the 'all' first argument, the command accepts a second argument detailing the Google Sheet range to read.
 If only one argument is provided, the hardcoded default range will be used.`,
-	usage: 'all|units|items|stats|inventory [Tab!TopLeftCell:BottomRightCell]',
+	usage: 'units|items|stats|inventory [Tab!TopLeftCell:BottomRightCell]',
 	args: true,
-	cooldown: 5,
+	cooldown: 2,
 	execute(message, args) {
 		// Load client secrets from a local file.
 		fs.readFile('credentials.json', (err, content) => {
@@ -145,8 +235,12 @@ If only one argument is provided, the hardcoded default range will be used.`,
 				case 'stats':
 					authorize(JSON.parse(content), setupStats, message, range);
 					break;
-				case 'all':
-					authorize(JSON.parse(content), setupStats, message, null);
+				case 'units':
+					if (isDegenerate(teamQ) || isDegenerate(teamQ.statNames.length === 0)) {
+						message.channel.send("Stats must be initialized first.")
+						break;
+					}
+					authorize(JSON.parse(content), setupUnits, message, range);
 					break;
 				default:
 					message.channel.send(`Invalid argument. Valid arguments are: ${this.usage}`);

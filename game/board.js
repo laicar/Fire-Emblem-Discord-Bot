@@ -1,3 +1,5 @@
+const Unit = require('./unit');
+
 const Board = function Board() {
     this.units = new Map();
 };
